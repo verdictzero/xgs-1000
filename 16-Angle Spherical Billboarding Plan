@@ -1,0 +1,190 @@
+System Design Specification: Discrete 16-Angle Spherical Billboarding
+
+Version: 1.0
+Type: Rendering / Animation Logic
+Context: "Doom-style" 2.5D Sprite System with extended verticality.
+
+1. Executive Summary
+
+This document outlines the logic for a "2.5D" sprite rendering system. Unlike the traditional Doom engine (which used 8 horizontal angles), this system utilizes a spherical coordinate lookup consisting of 16 horizontal angles across 3 vertical elevation rings, plus distinct Top and Bottom cap states.
+
+2. System Constants
+
+2.1 Resolution
+
+Horizontal Segments (Azimuth): 16
+
+Slice Width: $22.5^\circ$
+
+Vertical Bands (Elevation): 5
+
+Top Cap (Zenith)
+
+Upper Ring ($+45^\circ$)
+
+Mid Ring ($0^\circ$)
+
+Lower Ring ($-45^\circ$)
+
+Bottom Cap (Nadir)
+
+2.2 Coordinate Assumptions (Language Agnostic)
+
+Up Axis: Y+ (Modify to Z+ if engine requires).
+
+Forward Axis: Z+
+
+Rotation: Degrees (0-360), Clockwise.
+
+Zero Heading: North (or Forward).
+
+3. Asset Naming Convention
+
+To function, the code must parse string filenames or query a ScriptableObject/Struct database. The expected nomenclature is:
+
+{EntityName}_{Action}_{Elevation}_{AngleIndex}
+
+Definitions:
+
+EntityName: PLAYER, ENEMY_A, etc.
+
+Action: IDLE, WALK, ATTACK.
+
+Elevation:
+
+TOP (90°)
+
+UPR (45°)
+
+MID (0°)
+
+LWR (-45°)
+
+BOT (-90°)
+
+AngleIndex: 00 through 15.
+
+00 = Facing Camera (South)
+
+04 = Facing Left (West)
+
+08 = Facing Away (North)
+
+12 = Facing Right (East)
+
+Note: Top and Bottom caps may ignore AngleIndex if they are radially symmetrical, or use AngleIndex 00 if rotating the sprite via code.
+
+4. Mathematical Logic
+
+The system requires two inputs:
+
+Camera Position (CamPos)
+
+Entity Position (EntPos) and Entity Forward Vector (EntFwd)
+
+4.1 Step 1: Calculate Relative Elevation (Pitch)
+
+Determine which vertical ring to use based on the angle between the camera and the entity's horizon.
+
+Pseudocode:
+
+Vector3 delta = CamPos - EntPos
+Float distance_horizontal = length(delta.x, delta.z)
+Float height_diff = delta.y
+
+// Atan2 returns radians, convert to degrees
+Float pitch_angle = degrees(atan2(height_diff, distance_horizontal))
+
+
+Bucket Logic (Hysteresis recommended):
+
+TOP: pitch_angle > 67.5
+
+UPR: 22.5 < pitch_angle <= 67.5
+
+MID: -22.5 <= pitch_angle <= 22.5
+
+LWR: -67.5 <= pitch_angle < -22.5
+
+BOT: pitch_angle < -67.5
+
+4.2 Step 2: Calculate Relative Azimuth (Heading)
+
+Determine the horizontal angle index (0-15). This is the angle of the Camera relative to where the Entity is facing.
+
+Pseudocode:
+
+// 1. Get angle from Entity to Camera
+Vector3 dir_to_cam = normalize(CamPos - EntPos)
+Float global_angle_to_cam = degrees(atan2(dir_to_cam.x, dir_to_cam.z))
+
+// 2. Get Entity's global rotation
+Float entity_facing_angle = EntFwd.rotation_y
+
+// 3. Calculate Relative Angle
+Float relative_angle = global_angle_to_cam - entity_facing_angle
+
+// 4. Normalize to 0-360 range
+while (relative_angle < 0) relative_angle += 360
+while (relative_angle >= 360) relative_angle -= 360
+
+// 5. Offset by half a slice (11.25 degrees) so angle 0 represents the center of the wedge, not the start
+Float slice_size = 360.0 / 16.0
+Float shifted_angle = relative_angle + (slice_size / 2.0)
+
+// 6. Calculate Index
+Integer angle_index = floor(shifted_angle / slice_size)
+
+// 7. Clamp modulo 16 (handles the wrap-around at 360)
+angle_index = angle_index % 16
+
+
+5. Optimization: Sprite Mirroring
+
+To save texture memory, sprites 9 through 15 can be mirrored versions of 7 through 1.
+
+Mirror Map:
+
+Index 0 (Front): Unique
+
+Index 1-7 (Right Side): Unique
+
+Index 8 (Back): Unique
+
+Index 9-15 (Left Side): Mirror of 7-1
+
+Logic:
+
+Boolean mirror_sprite = false
+
+if (angle_index > 8) {
+    angle_index = 16 - angle_index
+    mirror_sprite = true
+}
+
+
+6. Implementation Prompt Template
+
+Copy and paste the text below to an LLM to generate your specific code.
+
+"I need a sprite billing system script in [INSERT LANGUAGE/ENGINE HERE].
+
+Please implement the logic described in the attached 'System Design Specification'.
+
+Requirements:
+
+Create a class/struct to hold the sprite sheets for the 5 elevation bands (Top, Upper, Mid, Lower, Bottom).
+
+Implement the GetSprite(camera, entity) function that returns:
+
+The Texture/Sprite reference.
+
+A boolean for whether to flip the sprite horizontally (Mirroring).
+
+Use 16 horizontal angles (22.5 degrees per slice).
+
+Use the specific pitch thresholds defined in Section 4.1 of the spec.
+
+Handle the 0-360 degree wrap-around correctly.
+
+Assume I have a set of arrays for the sprites named sprites_mid, sprites_upper, etc."

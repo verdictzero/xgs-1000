@@ -1,0 +1,2019 @@
+# Detailed Development Plan for Fantasy Console
+## Pi Zero 2 W Runtime + Desktop Editor
+
+---
+
+## Project Structure
+
+```
+fantasy-console/
+├── runtime/                    # C/C++ runtime for Pi Zero 2 W
+│   ├── src/
+│   │   ├── core/
+│   │   ├── renderer/
+│   │   ├── physics/
+│   │   ├── scene/
+│   │   ├── audio/
+│   │   └── platform/
+│   ├── include/
+│   ├── shaders/
+│   ├── tests/
+│   ├── CMakeLists.txt
+│   └── README.md
+├── editor/                     # Python editor for desktop
+│   ├── src/
+│   │   ├── ui/
+│   │   ├── tools/
+│   │   ├── compiler/
+│   │   ├── preview/
+│   │   └── widgets/
+│   ├── resources/
+│   │   ├── icons/
+│   │   ├── shaders/
+│   │   └── fonts/
+│   ├── tests/
+│   ├── setup.py
+│   ├── requirements.txt
+│   └── README.md
+├── specs/                      # Format specifications
+│   ├── CONSOLE_SPEC.md
+│   ├── FCS_FORMAT.md
+│   └── API_REFERENCE.md
+├── examples/                   # Example projects
+│   ├── hello_cube/
+│   ├── physics_demo/
+│   └── mini_game/
+├── tools/                      # Build scripts, utilities
+│   ├── cross-compile.sh
+│   ├── deploy-to-pi.sh
+│   └── generate-docs.sh
+├── docs/                       # Documentation
+│   ├── getting-started.md
+│   ├── artist-guide.md
+│   └── developer-guide.md
+└── README.md
+```
+
+---
+
+# PART 1: RUNTIME ENGINE (C/C++)
+
+## Phase 1A: Core Foundation (Week 1-2)
+
+### Task 1.1: Project Setup
+**Goal**: Get a minimal build system working
+
+```cmake
+# runtime/CMakeLists.txt
+cmake_minimum_required(VERSION 3.18)
+project(FantasyConsoleRuntime C CXX)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
+
+# Platform detection
+if(RASPBERRY_PI)
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=armv8-a -mfpu=neon-fp-armv8")
+    find_package(OpenGLES2 REQUIRED)
+else()
+    find_package(OpenGL REQUIRED)
+endif()
+
+# Libraries
+find_package(OpenAL REQUIRED)
+find_library(GLM glm)
+
+add_subdirectory(src)
+add_subdirectory(tests)
+```
+
+**Files to create**:
+- `runtime/CMakeLists.txt`
+- `runtime/cmake/arm-toolchain.cmake` (cross-compile config)
+- `runtime/.gitignore`
+- `runtime/README.md`
+
+**Deliverable**: Can build empty main.c on both desktop and Pi
+
+---
+
+### Task 1.2: Memory Management
+**Goal**: Fixed-size memory pools for deterministic allocation
+
+**Files**:
+```c
+// runtime/include/core/memory.h
+#ifndef MEMORY_H
+#define MEMORY_H
+
+#include <stddef.h>
+#include <stdbool.h>
+
+typedef struct MemoryPool {
+    void* memory;
+    size_t block_size;
+    size_t block_count;
+    size_t used_blocks;
+    unsigned char* free_list;
+} MemoryPool;
+
+// Initialize pool with fixed block size
+bool memory_pool_init(MemoryPool* pool, size_t block_size, size_t block_count);
+
+// Allocate from pool
+void* memory_pool_alloc(MemoryPool* pool);
+
+// Free back to pool
+void memory_pool_free(MemoryPool* pool, void* ptr);
+
+// Destroy pool
+void memory_pool_destroy(MemoryPool* pool);
+
+// Get stats
+size_t memory_pool_used_bytes(const MemoryPool* pool);
+float memory_pool_fragmentation(const MemoryPool* pool);
+
+#endif
+```
+
+```c
+// runtime/src/core/memory.c
+#include "core/memory.h"
+#include <stdlib.h>
+#include <string.h>
+
+bool memory_pool_init(MemoryPool* pool, size_t block_size, size_t block_count) {
+    // Align block size to 16 bytes for SIMD
+    block_size = (block_size + 15) & ~15;
+
+    pool->block_size = block_size;
+    pool->block_count = block_count;
+    pool->used_blocks = 0;
+
+    // Allocate memory
+    pool->memory = aligned_alloc(16, block_size * block_count);
+    if (!pool->memory) return false;
+
+    // Initialize free list (bitfield)
+    size_t free_list_size = (block_count + 7) / 8;
+    pool->free_list = calloc(free_list_size, 1);
+    if (!pool->free_list) {
+        free(pool->memory);
+        return false;
+    }
+
+    return true;
+}
+
+// Implement other functions...
+```
+
+**Test**:
+```c
+// runtime/tests/test_memory.c
+#include "core/memory.h"
+#include <assert.h>
+#include <stdio.h>
+
+void test_basic_allocation() {
+    MemoryPool pool;
+    assert(memory_pool_init(&pool, 64, 100));
+
+    void* ptr1 = memory_pool_alloc(&pool);
+    assert(ptr1 != NULL);
+
+    void* ptr2 = memory_pool_alloc(&pool);
+    assert(ptr2 != NULL);
+    assert(ptr1 != ptr2);
+
+    memory_pool_free(&pool, ptr1);
+    memory_pool_free(&pool, ptr2);
+
+    memory_pool_destroy(&pool);
+    printf("✓ Basic allocation test passed\n");
+}
+
+int main() {
+    test_basic_allocation();
+    return 0;
+}
+```
+
+**Deliverable**: Memory pool system with unit tests
+
+---
+
+### Task 1.3: Math Library
+**Goal**: Vectors, matrices, quaternions optimized for ARM NEON
+
+**Files**:
+```c
+// runtime/include/core/math_types.h
+#ifndef MATH_TYPES_H
+#define MATH_TYPES_H
+
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+
+typedef struct {
+    float x, y, z;
+} Vec3;
+
+typedef struct {
+    float x, y, z, w;
+} Vec4;
+
+typedef struct {
+    float x, y, z, w;
+} Quat;
+
+typedef struct {
+    float m[16]; // Column-major for OpenGL
+} Mat4;
+
+// Vec3 operations
+Vec3 vec3_add(Vec3 a, Vec3 b);
+Vec3 vec3_sub(Vec3 a, Vec3 b);
+Vec3 vec3_mul(Vec3 v, float s);
+float vec3_dot(Vec3 a, Vec3 b);
+Vec3 vec3_cross(Vec3 a, Vec3 b);
+float vec3_length(Vec3 v);
+Vec3 vec3_normalize(Vec3 v);
+
+// Mat4 operations
+Mat4 mat4_identity();
+Mat4 mat4_perspective(float fov, float aspect, float near, float far);
+Mat4 mat4_look_at(Vec3 eye, Vec3 target, Vec3 up);
+Mat4 mat4_translate(Vec3 t);
+Mat4 mat4_rotate(Quat q);
+Mat4 mat4_scale(Vec3 s);
+Mat4 mat4_mul(Mat4 a, Mat4 b);
+Vec4 mat4_mul_vec4(Mat4 m, Vec4 v);
+
+// Quat operations
+Quat quat_from_axis_angle(Vec3 axis, float angle);
+Quat quat_mul(Quat a, Quat b);
+Quat quat_normalize(Quat q);
+Mat4 quat_to_mat4(Quat q);
+
+#endif
+```
+
+**Implementation notes**:
+- Use ARM NEON intrinsics where available
+- Fall back to scalar operations on desktop
+- Write SIMD and scalar versions, select at compile time
+
+**Deliverable**: Complete math library with benchmarks showing NEON speedup
+
+---
+
+## Phase 1B: Rendering Foundation (Week 3-4)
+
+### Task 1.4: OpenGL ES 2.0 Context Setup
+
+**Files**:
+```c
+// runtime/include/renderer/context.h
+#ifndef CONTEXT_H
+#define CONTEXT_H
+
+#include <stdbool.h>
+
+#ifdef RASPBERRY_PI
+#include <EGL/egl.h>
+#include <GLES2/gl2.h>
+#else
+#include <GL/gl.h>
+#include <GL/glext.h>
+#endif
+
+typedef struct {
+    int width;
+    int height;
+    bool fullscreen;
+
+#ifdef RASPBERRY_PI
+    EGLDisplay display;
+    EGLContext context;
+    EGLSurface surface;
+#else
+    void* window; // SDL or GLFW window
+#endif
+} RenderContext;
+
+bool render_context_init(RenderContext* ctx, int width, int height, bool fullscreen);
+void render_context_swap_buffers(RenderContext* ctx);
+void render_context_destroy(RenderContext* ctx);
+
+#endif
+```
+
+```c
+// runtime/src/renderer/context.c
+#ifdef RASPBERRY_PI
+
+#include "renderer/context.h"
+#include <bcm_host.h>
+#include <stdio.h>
+
+bool render_context_init(RenderContext* ctx, int width, int height, bool fullscreen) {
+    bcm_host_init();
+
+    // Get display size
+    uint32_t screen_width, screen_height;
+    if (graphics_get_display_size(0, &screen_width, &screen_height) < 0) {
+        fprintf(stderr, "Failed to get display size\n");
+        return false;
+    }
+
+    ctx->width = width;
+    ctx->height = height;
+
+    // EGL setup
+    EGLint num_config;
+    EGLConfig config;
+
+    static const EGLint attribute_list[] = {
+        EGL_RED_SIZE, 8,
+        EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE, 8,
+        EGL_ALPHA_SIZE, 8,
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_NONE
+    };
+
+    static const EGLint context_attributes[] = {
+        EGL_CONTEXT_CLIENT_VERSION, 2,
+        EGL_NONE
+    };
+
+    ctx->display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (ctx->display == EGL_NO_DISPLAY) {
+        fprintf(stderr, "Failed to get EGL display\n");
+        return false;
+    }
+
+    if (!eglInitialize(ctx->display, NULL, NULL)) {
+        fprintf(stderr, "Failed to initialize EGL\n");
+        return false;
+    }
+
+    if (!eglChooseConfig(ctx->display, attribute_list, &config, 1, &num_config)) {
+        fprintf(stderr, "Failed to choose EGL config\n");
+        return false;
+    }
+
+    // Create window surface
+    static EGL_DISPMANX_WINDOW_T nativewindow;
+    DISPMANX_DISPLAY_HANDLE_T dispman_display = vc_dispmanx_display_open(0);
+    DISPMANX_UPDATE_HANDLE_T dispman_update = vc_dispmanx_update_start(0);
+
+    VC_RECT_T dst_rect = {0, 0, screen_width, screen_height};
+    VC_RECT_T src_rect = {0, 0, width << 16, height << 16};
+
+    DISPMANX_ELEMENT_HANDLE_T dispman_element = vc_dispmanx_element_add(
+        dispman_update, dispman_display, 0, &dst_rect, 0,
+        &src_rect, DISPMANX_PROTECTION_NONE, 0, 0, 0
+    );
+
+    nativewindow.element = dispman_element;
+    nativewindow.width = width;
+    nativewindow.height = height;
+    vc_dispmanx_update_submit_sync(dispman_update);
+
+    ctx->surface = eglCreateWindowSurface(ctx->display, config, &nativewindow, NULL);
+    if (ctx->surface == EGL_NO_SURFACE) {
+        fprintf(stderr, "Failed to create EGL surface\n");
+        return false;
+    }
+
+    ctx->context = eglCreateContext(ctx->display, config, EGL_NO_CONTEXT, context_attributes);
+    if (ctx->context == EGL_NO_CONTEXT) {
+        fprintf(stderr, "Failed to create EGL context\n");
+        return false;
+    }
+
+    if (!eglMakeCurrent(ctx->display, ctx->surface, ctx->surface, ctx->context)) {
+        fprintf(stderr, "Failed to make EGL context current\n");
+        return false;
+    }
+
+    // Set viewport
+    glViewport(0, 0, width, height);
+
+    return true;
+}
+
+void render_context_swap_buffers(RenderContext* ctx) {
+    eglSwapBuffers(ctx->display, ctx->surface);
+}
+
+void render_context_destroy(RenderContext* ctx) {
+    eglDestroySurface(ctx->display, ctx->surface);
+    eglDestroyContext(ctx->display, ctx->context);
+    eglTerminate(ctx->display);
+    bcm_host_deinit();
+}
+
+#else
+// Desktop implementation using SDL2 or GLFW
+// ... implement for desktop testing
+#endif
+```
+
+**Deliverable**: Can open fullscreen window on Pi Zero 2 W with OpenGL ES context
+
+---
+
+### Task 1.5: Shader System
+
+**Files**:
+```c
+// runtime/include/renderer/shader.h
+#ifndef SHADER_H
+#define SHADER_H
+
+#include <GLES2/gl2.h>
+#include <stdbool.h>
+#include "core/math_types.h"
+
+typedef struct {
+    GLuint program;
+    GLuint vertex_shader;
+    GLuint fragment_shader;
+} Shader;
+
+bool shader_load(Shader* shader, const char* vertex_src, const char* fragment_src);
+void shader_use(const Shader* shader);
+void shader_destroy(Shader* shader);
+
+// Uniform setters
+void shader_set_mat4(const Shader* shader, const char* name, const Mat4* matrix);
+void shader_set_vec3(const Shader* shader, const char* name, Vec3 v);
+void shader_set_float(const Shader* shader, const char* name, float value);
+void shader_set_int(const Shader* shader, const char* name, int value);
+
+#endif
+```
+
+**Built-in shaders**:
+```glsl
+// runtime/shaders/basic.vert
+attribute vec3 a_position;
+attribute vec3 a_normal;
+attribute vec2 a_texcoord;
+
+uniform mat4 u_model;
+uniform mat4 u_view;
+uniform mat4 u_projection;
+
+varying vec3 v_normal;
+varying vec2 v_texcoord;
+varying vec3 v_world_pos;
+
+void main() {
+    vec4 world_pos = u_model * vec4(a_position, 1.0);
+    v_world_pos = world_pos.xyz;
+    v_normal = mat3(u_model) * a_normal;
+    v_texcoord = a_texcoord;
+    gl_Position = u_projection * u_view * world_pos;
+}
+```
+
+```glsl
+// runtime/shaders/basic.frag
+precision mediump float;
+
+varying vec3 v_normal;
+varying vec2 v_texcoord;
+varying vec3 v_world_pos;
+
+uniform sampler2D u_texture;
+uniform vec3 u_light_pos;
+uniform vec3 u_light_color;
+uniform vec3 u_ambient;
+
+void main() {
+    // Gouraud shading (vertex lighting interpolated)
+    vec3 normal = normalize(v_normal);
+    vec3 light_dir = normalize(u_light_pos - v_world_pos);
+    float diff = max(dot(normal, light_dir), 0.0);
+
+    vec3 lighting = u_ambient + u_light_color * diff;
+
+    // Point-sampled texture (no filtering)
+    vec4 tex_color = texture2D(u_texture, v_texcoord);
+
+    gl_FragColor = vec4(lighting * tex_color.rgb, tex_color.a);
+
+    // Alpha test
+    if (gl_FragColor.a < 0.5) {
+        discard;
+    }
+}
+```
+
+**Deliverable**: Shader loading system with basic Gouraud-shaded material
+
+---
+
+### Task 1.6: Mesh Rendering
+
+**Files**:
+```c
+// runtime/include/renderer/mesh.h
+#ifndef MESH_H
+#define MESH_H
+
+#include <GLES2/gl2.h>
+#include "core/math_types.h"
+
+typedef struct {
+    float position[3];
+    float normal[3];
+    float texcoord[2];
+} Vertex;
+
+typedef struct {
+    GLuint vao; // Not supported in GLES2, use manual state
+    GLuint vbo;
+    GLuint ebo;
+
+    Vertex* vertices;
+    unsigned int* indices;
+
+    size_t vertex_count;
+    size_t index_count;
+
+    // AABB for culling
+    Vec3 aabb_min;
+    Vec3 aabb_max;
+} Mesh;
+
+bool mesh_create(Mesh* mesh, Vertex* vertices, size_t vertex_count,
+                 unsigned int* indices, size_t index_count);
+void mesh_draw(const Mesh* mesh);
+void mesh_destroy(Mesh* mesh);
+
+// Helper: Generate test meshes
+Mesh* mesh_create_cube();
+Mesh* mesh_create_sphere(int subdivisions);
+
+#endif
+```
+
+**Implementation**:
+```c
+// runtime/src/renderer/mesh.c
+#include "renderer/mesh.h"
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+bool mesh_create(Mesh* mesh, Vertex* vertices, size_t vertex_count,
+                 unsigned int* indices, size_t index_count) {
+    mesh->vertex_count = vertex_count;
+    mesh->index_count = index_count;
+
+    // Copy vertex/index data
+    mesh->vertices = malloc(sizeof(Vertex) * vertex_count);
+    mesh->indices = malloc(sizeof(unsigned int) * index_count);
+    memcpy(mesh->vertices, vertices, sizeof(Vertex) * vertex_count);
+    memcpy(mesh->indices, indices, sizeof(unsigned int) * index_count);
+
+    // Calculate AABB
+    mesh->aabb_min = (Vec3){INFINITY, INFINITY, INFINITY};
+    mesh->aabb_max = (Vec3){-INFINITY, -INFINITY, -INFINITY};
+
+    for (size_t i = 0; i < vertex_count; i++) {
+        Vec3 pos = {vertices[i].position[0], vertices[i].position[1], vertices[i].position[2]};
+        mesh->aabb_min.x = fminf(mesh->aabb_min.x, pos.x);
+        mesh->aabb_min.y = fminf(mesh->aabb_min.y, pos.y);
+        mesh->aabb_min.z = fminf(mesh->aabb_min.z, pos.z);
+        mesh->aabb_max.x = fmaxf(mesh->aabb_max.x, pos.x);
+        mesh->aabb_max.y = fmaxf(mesh->aabb_max.y, pos.y);
+        mesh->aabb_max.z = fmaxf(mesh->aabb_max.z, pos.z);
+    }
+
+    // Upload to GPU
+    glGenBuffers(1, &mesh->vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, mesh->vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(Vertex) * vertex_count, vertices, GL_STATIC_DRAW);
+
+    glGenBuffers(1, &mesh->ebo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh->ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(unsigned int) * index_count, indices, GL_STATIC_DRAW);
+
+    return true;
+}
+
+void mesh_draw(const Mesh* mesh) {
+    glBindBuffer(GL_ARRAY_BUFFER, mesh->vbo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh->ebo);
+
+    // Position attribute
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)0);
+
+    // Normal attribute
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, normal));
+
+    // Texcoord attribute
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, texcoord));
+
+    glDrawElements(GL_TRIANGLES, mesh->index_count, GL_UNSIGNED_INT, 0);
+
+    glDisableVertexAttribArray(0);
+    glDisableVertexAttribArray(1);
+    glDisableVertexAttribArray(2);
+}
+
+void mesh_destroy(Mesh* mesh) {
+    glDeleteBuffers(1, &mesh->vbo);
+    glDeleteBuffers(1, &mesh->ebo);
+    free(mesh->vertices);
+    free(mesh->indices);
+}
+```
+
+**Deliverable**: Can render a spinning cube at 30fps on Pi Zero 2 W
+
+---
+
+## Phase 1C: Scene System (Week 5-6)
+
+### Task 1.7: Transform Hierarchy
+
+**Files**:
+```c
+// runtime/include/scene/transform.h
+#ifndef TRANSFORM_H
+#define TRANSFORM_H
+
+#include "core/math_types.h"
+#include <stdbool.h>
+
+#define MAX_CHILDREN 32
+
+typedef struct Transform Transform;
+
+struct Transform {
+    // Local space
+    Vec3 position;
+    Quat rotation;
+    Vec3 scale;
+
+    // World space (cached)
+    Mat4 world_matrix;
+    bool dirty;
+
+    // Hierarchy
+    Transform* parent;
+    Transform* children[MAX_CHILDREN];
+    int child_count;
+};
+
+void transform_init(Transform* t);
+void transform_set_parent(Transform* t, Transform* parent);
+void transform_update_world_matrix(Transform* t);
+Mat4 transform_get_world_matrix(Transform* t);
+
+// Local space setters
+void transform_translate(Transform* t, Vec3 offset);
+void transform_rotate(Transform* t, Vec3 axis, float angle);
+void transform_set_scale(Transform* t, Vec3 scale);
+
+#endif
+```
+
+**Deliverable**: Transform hierarchy with max depth enforcement (6 levels)
+
+---
+
+### Task 1.8: Entity Component System (Lightweight)
+
+**Files**:
+```c
+// runtime/include/scene/entity.h
+#ifndef ENTITY_H
+#define ENTITY_H
+
+#include "scene/transform.h"
+#include "renderer/mesh.h"
+#include <stdbool.h>
+
+typedef enum {
+    COMPONENT_TRANSFORM = 1 << 0,
+    COMPONENT_MESH_RENDERER = 1 << 1,
+    COMPONENT_COLLIDER = 1 << 2,
+    COMPONENT_RIGIDBODY = 1 << 3,
+} ComponentFlags;
+
+typedef struct {
+    unsigned int id;
+    ComponentFlags components;
+
+    Transform transform;
+
+    // Renderer component
+    Mesh* mesh;
+    unsigned int material_id;
+
+    // Physics component
+    void* collider;
+    void* rigidbody;
+
+    bool active;
+} Entity;
+
+typedef struct {
+    Entity* entities;
+    size_t entity_count;
+    size_t entity_capacity;
+} Scene;
+
+Scene* scene_create();
+Entity* scene_add_entity(Scene* scene);
+void scene_remove_entity(Scene* scene, unsigned int entity_id);
+Entity* scene_get_entity(Scene* scene, unsigned int entity_id);
+void scene_destroy(Scene* scene);
+
+#endif
+```
+
+**Deliverable**: Simple ECS with entity pooling
+
+---
+
+## Phase 1D: LOD System (Week 7)
+
+### Task 1.9: LOD Manager
+
+**Files**:
+```c
+// runtime/include/renderer/lod.h
+#ifndef LOD_H
+#define LOD_H
+
+#include "renderer/mesh.h"
+#include "core/math_types.h"
+
+#define MAX_LOD_LEVELS 4
+
+typedef enum {
+    LOD_HIGH = 0,
+    LOD_MEDIUM = 1,
+    LOD_LOW = 2,
+    LOD_CULLED = 3
+} LODLevel;
+
+typedef struct {
+    Mesh* lods[MAX_LOD_LEVELS - 1]; // High, Medium, Low (no mesh for culled)
+    float distances[MAX_LOD_LEVELS]; // 0, 50, 100, 150
+} LODGroup;
+
+bool lod_group_create(LODGroup* group, Mesh* high, Mesh* medium, Mesh* low);
+LODLevel lod_get_level(const LODGroup* group, Vec3 object_pos, Vec3 camera_pos);
+Mesh* lod_get_mesh(const LODGroup* group, LODLevel level);
+void lod_group_destroy(LODGroup* group);
+
+#endif
+```
+
+**Implementation**:
+```c
+// runtime/src/renderer/lod.c
+#include "renderer/lod.h"
+#include <math.h>
+
+bool lod_group_create(LODGroup* group, Mesh* high, Mesh* medium, Mesh* low) {
+    group->lods[0] = high;
+    group->lods[1] = medium;
+    group->lods[2] = low;
+
+    group->distances[0] = 0.0f;
+    group->distances[1] = 50.0f;
+    group->distances[2] = 100.0f;
+    group->distances[3] = 150.0f;
+
+    return true;
+}
+
+LODLevel lod_get_level(const LODGroup* group, Vec3 object_pos, Vec3 camera_pos) {
+    Vec3 delta = vec3_sub(object_pos, camera_pos);
+    float distance = vec3_length(delta);
+
+    if (distance < group->distances[1]) return LOD_HIGH;
+    if (distance < group->distances[2]) return LOD_MEDIUM;
+    if (distance < group->distances[3]) return LOD_LOW;
+    return LOD_CULLED;
+}
+
+Mesh* lod_get_mesh(const LODGroup* group, LODLevel level) {
+    if (level == LOD_CULLED) return NULL;
+    return group->lods[level];
+}
+
+void lod_group_destroy(LODGroup* group) {
+    // Meshes are owned externally, just clear pointers
+    for (int i = 0; i < MAX_LOD_LEVELS - 1; i++) {
+        group->lods[i] = NULL;
+    }
+}
+```
+
+**Deliverable**: LOD system with distance-based switching
+
+---
+
+## Phase 1E: Physics (Week 8-9)
+
+### Task 1.10: Collision Detection
+
+**Files**:
+```c
+// runtime/include/physics/collision.h
+#ifndef COLLISION_H
+#define COLLISION_H
+
+#include "core/math_types.h"
+#include <stdbool.h>
+
+typedef enum {
+    COLLIDER_BOX,
+    COLLIDER_SPHERE,
+    COLLIDER_CAPSULE
+} ColliderType;
+
+typedef struct {
+    Vec3 center;
+    Vec3 extents; // Half-extents
+} BoxCollider;
+
+typedef struct {
+    Vec3 center;
+    float radius;
+} SphereCollider;
+
+typedef struct {
+    Vec3 point_a;
+    Vec3 point_b;
+    float radius;
+} CapsuleCollider;
+
+typedef struct {
+    ColliderType type;
+    union {
+        BoxCollider box;
+        SphereCollider sphere;
+        CapsuleCollider capsule;
+    };
+} Collider;
+
+typedef struct {
+    Vec3 point;
+    Vec3 normal;
+    float penetration;
+} ContactPoint;
+
+bool collide_sphere_sphere(const SphereCollider* a, const SphereCollider* b, ContactPoint* contact);
+bool collide_box_box(const BoxCollider* a, const BoxCollider* b, ContactPoint* contact);
+bool collide_sphere_box(const SphereCollider* sphere, const BoxCollider* box, ContactPoint* contact);
+
+#endif
+```
+
+**Deliverable**: Basic collision detection for primitive shapes
+
+---
+
+### Task 1.11: Rigid Body Dynamics
+
+**Files**:
+```c
+// runtime/include/physics/rigidbody.h
+#ifndef RIGIDBODY_H
+#define RIGIDBODY_H
+
+#include "core/math_types.h"
+#include "physics/collision.h"
+
+typedef struct {
+    Vec3 position;
+    Quat rotation;
+
+    Vec3 velocity;
+    Vec3 angular_velocity;
+
+    float mass;
+    float inv_mass;
+
+    Vec3 force;
+    Vec3 torque;
+
+    bool is_kinematic; // Doesn't respond to forces
+    bool is_sleeping;
+
+    Collider* collider;
+} RigidBody;
+
+void rigidbody_init(RigidBody* rb, float mass, Collider* collider);
+void rigidbody_apply_force(RigidBody* rb, Vec3 force);
+void rigidbody_apply_impulse(RigidBody* rb, Vec3 impulse);
+void rigidbody_integrate(RigidBody* rb, float dt);
+
+#endif
+```
+
+**Deliverable**: Basic rigid body physics with gravity
+
+---
+
+### Task 1.12: Physics World
+
+**Files**:
+```c
+// runtime/include/physics/physics_world.h
+#ifndef PHYSICS_WORLD_H
+#define PHYSICS_WORLD_H
+
+#include "physics/rigidbody.h"
+
+#define MAX_RIGIDBODIES 50
+
+typedef struct {
+    RigidBody bodies[MAX_RIGIDBODIES];
+    int body_count;
+
+    Vec3 gravity;
+    float timestep; // Fixed 1/60
+    float accumulator;
+} PhysicsWorld;
+
+void physics_world_init(PhysicsWorld* world, Vec3 gravity);
+void physics_world_add_body(PhysicsWorld* world, RigidBody* body);
+void physics_world_step(PhysicsWorld* world, float dt);
+void physics_world_destroy(PhysicsWorld* world);
+
+#endif
+```
+
+**Implementation**:
+```c
+// runtime/src/physics/physics_world.c
+#include "physics/physics_world.h"
+#include <string.h>
+
+void physics_world_init(PhysicsWorld* world, Vec3 gravity) {
+    memset(world, 0, sizeof(PhysicsWorld));
+    world->gravity = gravity;
+    world->timestep = 1.0f / 60.0f;
+    world->accumulator = 0.0f;
+}
+
+void physics_world_add_body(PhysicsWorld* world, RigidBody* body) {
+    if (world->body_count < MAX_RIGIDBODIES) {
+        world->bodies[world->body_count++] = *body;
+    }
+}
+
+void physics_world_step(PhysicsWorld* world, float dt) {
+    world->accumulator += dt;
+
+    while (world->accumulator >= world->timestep) {
+        // Apply gravity
+        for (int i = 0; i < world->body_count; i++) {
+            RigidBody* body = &world->bodies[i];
+            if (!body->is_kinematic) {
+                Vec3 gravity_force = vec3_mul(world->gravity, body->mass);
+                rigidbody_apply_force(body, gravity_force);
+            }
+        }
+
+        // Integrate
+        for (int i = 0; i < world->body_count; i++) {
+            rigidbody_integrate(&world->bodies[i], world->timestep);
+        }
+
+        // Collision detection & resolution
+        for (int i = 0; i < world->body_count; i++) {
+            for (int j = i + 1; j < world->body_count; j++) {
+                // Detect and resolve collisions
+                // ... implement collision resolution
+            }
+        }
+
+        world->accumulator -= world->timestep;
+    }
+}
+```
+
+**Deliverable**: Physics world with fixed timestep and collision resolution
+
+---
+
+## Phase 1F: Audio (Week 10)
+
+### Task 1.13: Audio System
+
+**Files**:
+```c
+// runtime/include/audio/audio.h
+#ifndef AUDIO_H
+#define AUDIO_H
+
+#include <stdbool.h>
+#include <stddef.h>
+
+#define MAX_AUDIO_CHANNELS 4
+
+typedef struct {
+    short* samples;
+    size_t sample_count;
+    int sample_rate;
+    int channels;
+} AudioClip;
+
+typedef struct {
+    AudioClip* clip;
+    size_t position;
+    float volume;
+    bool playing;
+    bool looping;
+} AudioChannel;
+
+typedef struct {
+    AudioChannel channels[MAX_AUDIO_CHANNELS];
+    int sample_rate;
+    void* device; // Platform-specific
+} AudioSystem;
+
+bool audio_system_init(AudioSystem* audio, int sample_rate);
+bool audio_clip_load(AudioClip* clip, const char* filepath);
+void audio_play(AudioSystem* audio, AudioClip* clip, float volume, bool loop);
+void audio_stop(AudioSystem* audio, int channel);
+void audio_system_destroy(AudioSystem* audio);
+
+#endif
+```
+
+**Implementation** (use PortAudio or OpenAL):
+- Load 22kHz mono WAV files
+- Simple 4-channel mixer
+- Volume control per channel
+
+**Deliverable**: Audio playback with 4-channel mixing
+
+---
+
+## Phase 1G: File Format & Loading (Week 11-12)
+
+### Task 1.14: Binary Scene Format (.fcs)
+
+**Format Spec**:
+```
+FCS File Format v1.0
+====================
+
+Header (64 bytes):
+- Magic: "FCS\0" (4 bytes)
+- Version: uint32 (4 bytes)
+- Palette offset: uint64 (8 bytes)
+- Texture offset: uint64 (8 bytes)
+- Mesh offset: uint64 (8 bytes)
+- Scene offset: uint64 (8 bytes)
+- Reserved: (36 bytes)
+
+Palette Section:
+- Color count: uint32 (4 bytes)
+- Colors: RGB888 array (3 bytes each)
+
+Texture Section:
+- Texture count: uint32 (4 bytes)
+- For each texture:
+  - Width: uint16
+  - Height: uint16
+  - Format: uint8 (indexed)
+  - Data length: uint32
+  - Pixel data: uint8 array (palette indices)
+
+Mesh Section:
+- Mesh count: uint32
+- For each mesh:
+  - Vertex count: uint32
+  - Index count: uint32
+  - Vertex data: Vertex array
+  - Index data: uint32 array
+  - AABB: Vec3 min, Vec3 max
+
+Scene Section:
+- Entity count: uint32
+- For each entity:
+  - Component flags: uint32
+  - Transform: Vec3 pos, Quat rot, Vec3 scale
+  - Mesh index: uint32 (if has mesh renderer)
+  - Material index: uint32
+  - Collider data (if has collider)
+  - Physics data (if has rigidbody)
+```
+
+**Files**:
+```c
+// runtime/include/scene/scene_loader.h
+#ifndef SCENE_LOADER_H
+#define SCENE_LOADER_H
+
+#include "scene/entity.h"
+#include <stdbool.h>
+
+bool scene_load_fcs(Scene* scene, const char* filepath);
+bool scene_save_fcs(const Scene* scene, const char* filepath);
+
+#endif
+```
+
+**Deliverable**: Binary scene loader/saver
+
+---
+
+## Phase 1H: Main Loop & Testing (Week 13)
+
+### Task 1.15: Game Loop
+
+**Files**:
+```c
+// runtime/src/main.c
+#include "core/memory.h"
+#include "renderer/context.h"
+#include "renderer/shader.h"
+#include "scene/entity.h"
+#include "physics/physics_world.h"
+#include "audio/audio.h"
+#include <stdio.h>
+#include <time.h>
+
+typedef struct {
+    RenderContext render_ctx;
+    Scene* scene;
+    PhysicsWorld physics;
+    AudioSystem audio;
+
+    // Frame timing
+    double last_time;
+    double accumulator;
+    int frame_count;
+    double fps;
+} GameEngine;
+
+void engine_init(GameEngine* engine) {
+    // Initialize subsystems
+    render_context_init(&engine->render_ctx, 640, 480, true);
+    engine->scene = scene_create();
+    physics_world_init(&engine->physics, (Vec3){0, -9.8f, 0});
+    audio_system_init(&engine->audio, 22050);
+
+    // Load test scene
+    scene_load_fcs(engine->scene, "test_scene.fcs");
+
+    engine->last_time = (double)clock() / CLOCKS_PER_SEC;
+    engine->frame_count = 0;
+    engine->fps = 25.0;
+}
+
+void engine_update(GameEngine* engine, float dt) {
+    // Update physics
+    physics_world_step(&engine->physics, dt);
+
+    // Update transforms
+    for (size_t i = 0; i < engine->scene->entity_count; i++) {
+        Entity* e = &engine->scene->entities[i];
+        if (e->active) {
+            transform_update_world_matrix(&e->transform);
+        }
+    }
+}
+
+void engine_render(GameEngine* engine) {
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    // Render all entities
+    for (size_t i = 0; i < engine->scene->entity_count; i++) {
+        Entity* e = &engine->scene->entities[i];
+        if (e->active && (e->components & COMPONENT_MESH_RENDERER)) {
+            // Set transforms, draw mesh
+            mesh_draw(e->mesh);
+        }
+    }
+
+    render_context_swap_buffers(&engine->render_ctx);
+}
+
+void engine_run(GameEngine* engine) {
+    double target_frame_time = 1.0 / engine->fps;
+
+    while (1) {
+        double current_time = (double)clock() / CLOCKS_PER_SEC;
+        double dt = current_time - engine->last_time;
+        engine->last_time = current_time;
+
+        engine_update(engine, dt);
+        engine_render(engine);
+
+        engine->frame_count++;
+
+        // Frame rate limiting
+        double frame_time = ((double)clock() / CLOCKS_PER_SEC) - current_time;
+        if (frame_time < target_frame_time) {
+            // Sleep for remaining time
+            struct timespec sleep_time;
+            sleep_time.tv_sec = 0;
+            sleep_time.tv_nsec = (target_frame_time - frame_time) * 1000000000;
+            nanosleep(&sleep_time, NULL);
+        }
+    }
+}
+
+int main(int argc, char** argv) {
+    GameEngine engine;
+    engine_init(&engine);
+    engine_run(&engine);
+    return 0;
+}
+```
+
+**Deliverable**: Complete runtime that boots on Pi Zero 2 W
+
+---
+
+# PART 2: DESKTOP EDITOR (Python)
+
+## Phase 2A: Editor Foundation (Week 14-15)
+
+### Task 2.1: Project Setup
+
+**Files**:
+```python
+# editor/setup.py
+from setuptools import setup, find_packages
+
+setup(
+    name='fantasy-console-editor',
+    version='0.1.0',
+    packages=find_packages(where='src'),
+    package_dir={'': 'src'},
+    install_requires=[
+        'PySide6>=6.5.0',
+        'PyOpenGL>=3.1.6',
+        'numpy>=1.24.0',
+        'pillow>=10.0.0',
+        'PyWavefront>=1.3.3',
+    ],
+    entry_points={
+        'console_scripts': [
+            'fc-editor=editor.main:main',
+        ],
+    },
+)
+```
+
+```python
+# editor/requirements.txt
+PySide6>=6.5.0
+PyOpenGL>=3.1.6
+numpy>=1.24.0
+pillow>=10.0.0
+PyWavefront>=1.3.3
+```
+
+**Directory structure**:
+```
+editor/src/
+├── editor/
+│   ├── __init__.py
+│   ├── main.py
+│   ├── ui/
+│   │   ├── __init__.py
+│   │   ├── main_window.py
+│   │   ├── viewport.py
+│   │   ├── inspector.py
+│   │   └── hierarchy.py
+│   ├── tools/
+│   │   ├── __init__.py
+│   │   ├── mesh_importer.py
+│   │   └── texture_converter.py
+│   └── compiler/
+│       ├── __init__.py
+│       └── scene_compiler.py
+```
+
+**Deliverable**: Python package structure with PySide6 installed
+
+---
+
+### Task 2.2: Main Window
+
+**Files**:
+```python
+# editor/src/editor/ui/main_window.py
+from PySide6.QtWidgets import (
+    QMainWindow, QDockWidget, QWidget,
+    QVBoxLayout, QMenuBar, QStatusBar
+)
+from PySide6.QtCore import Qt
+from .viewport import Viewport3D
+from .inspector import InspectorPanel
+from .hierarchy import HierarchyPanel
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Fantasy Console Editor")
+        self.setGeometry(100, 100, 1600, 900)
+
+        self._setup_ui()
+        self._setup_menus()
+
+    def _setup_ui(self):
+        # Central widget: 3D viewport
+        self.viewport = Viewport3D()
+        self.setCentralWidget(self.viewport)
+
+        # Left dock: Hierarchy
+        self.hierarchy_dock = QDockWidget("Hierarchy", self)
+        self.hierarchy_panel = HierarchyPanel()
+        self.hierarchy_dock.setWidget(self.hierarchy_panel)
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.hierarchy_dock)
+
+        # Right dock: Inspector
+        self.inspector_dock = QDockWidget("Inspector", self)
+        self.inspector_panel = InspectorPanel()
+        self.inspector_dock.setWidget(self.inspector_panel)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.inspector_dock)
+
+        # Bottom: Console/stats
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+
+    def _setup_menus(self):
+        menubar = self.menuBar()
+
+        # File menu
+        file_menu = menubar.addMenu("File")
+        file_menu.addAction("New Scene", self.new_scene)
+        file_menu.addAction("Open Scene", self.open_scene)
+        file_menu.addAction("Save Scene", self.save_scene)
+        file_menu.addSeparator()
+        file_menu.addAction("Export to Pi", self.export_scene)
+        file_menu.addSeparator()
+        file_menu.addAction("Exit", self.close)
+
+        # Edit menu
+        edit_menu = menubar.addMenu("Edit")
+        edit_menu.addAction("Undo")
+        edit_menu.addAction("Redo")
+
+        # Assets menu
+        assets_menu = menubar.addMenu("Assets")
+        assets_menu.addAction("Import Mesh", self.import_mesh)
+        assets_menu.addAction("Import Texture", self.import_texture)
+
+    def new_scene(self):
+        # TODO: Clear scene
+        pass
+
+    def open_scene(self):
+        # TODO: File dialog
+        pass
+
+    def save_scene(self):
+        # TODO: Save to .fca (JSON)
+        pass
+
+    def export_scene(self):
+        # TODO: Compile to .fcs
+        pass
+
+    def import_mesh(self):
+        # TODO: Open mesh importer dialog
+        pass
+
+    def import_texture(self):
+        # TODO: Open texture importer dialog
+        pass
+```
+
+```python
+# editor/src/editor/main.py
+import sys
+from PySide6.QtWidgets import QApplication
+from editor.ui.main_window import MainWindow
+
+def main():
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
+
+if __name__ == '__main__':
+    main()
+```
+
+**Deliverable**: Qt application with docked panels
+
+---
+
+### Task 2.3: 3D Viewport with OpenGL
+
+**Files**:
+```python
+# editor/src/editor/ui/viewport.py
+from PySide6.QtWidgets import QOpenGLWidget
+from PySide6.QtCore import QTimer, Qt
+from PySide6.QtGui import QMatrix4x4, QVector3D
+from OpenGL.GL import *
+import numpy as np
+
+class Camera:
+    def __init__(self):
+        self.position = QVector3D(0, 5, 10)
+        self.target = QVector3D(0, 0, 0)
+        self.up = QVector3D(0, 1, 0)
+        self.fov = 60
+        self.near = 0.1
+        self.far = 1000
+
+    def get_view_matrix(self):
+        mat = QMatrix4x4()
+        mat.lookAt(self.position, self.target, self.up)
+        return mat
+
+    def get_projection_matrix(self, aspect):
+        mat = QMatrix4x4()
+        mat.perspective(self.fov, aspect, self.near, self.far)
+        return mat
+
+class Viewport3D(QOpenGLWidget):
+    def __init__(self):
+        super().__init__()
+        self.camera = Camera()
+        self.grid_size = 20
+
+        # Mouse interaction
+        self.last_mouse_pos = None
+
+        # Timer for continuous updates
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update)
+        self.timer.start(16)  # ~60fps
+
+    def initializeGL(self):
+        glEnable(GL_DEPTH_TEST)
+        glClearColor(0.2, 0.2, 0.3, 1.0)
+
+        # Create grid
+        self.grid_vbo = self._create_grid()
+
+    def resizeGL(self, w, h):
+        glViewport(0, 0, w, h)
+
+    def paintGL(self):
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+
+        # Draw grid
+        self._draw_grid()
+
+        # TODO: Draw scene entities
+
+    def _create_grid(self):
+        vertices = []
+        for i in range(-self.grid_size, self.grid_size + 1):
+            # Lines parallel to X axis
+            vertices.extend([
+                -self.grid_size, 0, i,
+                self.grid_size, 0, i
+            ])
+            # Lines parallel to Z axis
+            vertices.extend([
+                i, 0, -self.grid_size,
+                i, 0, self.grid_size
+            ])
+
+        vbo = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, vbo)
+        vertices_np = np.array(vertices, dtype=np.float32)
+        glBufferData(GL_ARRAY_BUFFER, vertices_np.nbytes, vertices_np, GL_STATIC_DRAW)
+
+        return vbo
+
+    def _draw_grid(self):
+        # Simple immediate mode for now
+        glColor3f(0.3, 0.3, 0.3)
+        glBegin(GL_LINES)
+        for i in range(-self.grid_size, self.grid_size + 1):
+            glVertex3f(-self.grid_size, 0, i)
+            glVertex3f(self.grid_size, 0, i)
+            glVertex3f(i, 0, -self.grid_size)
+            glVertex3f(i, 0, self.grid_size)
+        glEnd()
+
+    def mousePressEvent(self, event):
+        self.last_mouse_pos = event.pos()
+
+    def mouseMoveEvent(self, event):
+        if self.last_mouse_pos is None:
+            return
+
+        dx = event.x() - self.last_mouse_pos.x()
+        dy = event.y() - self.last_mouse_pos.y()
+
+        if event.buttons() & Qt.MiddleButton:
+            # Orbit camera
+            # TODO: Implement orbit
+            pass
+
+        self.last_mouse_pos = event.pos()
+
+    def wheelEvent(self, event):
+        # Zoom camera
+        delta = event.angleDelta().y() / 120.0
+        zoom_speed = 0.5
+        direction = (self.camera.target - self.camera.position).normalized()
+        self.camera.position += direction * delta * zoom_speed
+        self.update()
+```
+
+**Deliverable**: 3D viewport with grid and orbit camera
+
+---
+
+## Phase 2B: Asset Pipeline (Week 16-18)
+
+### Task 2.4: Mesh Importer
+
+**Files**:
+```python
+# editor/src/editor/tools/mesh_importer.py
+import pywavefront
+import numpy as np
+from dataclasses import dataclass
+from typing import List, Tuple
+
+@dataclass
+class Vertex:
+    position: Tuple[float, float, float]
+    normal: Tuple[float, float, float]
+    texcoord: Tuple[float, float]
+
+class MeshData:
+    def __init__(self):
+        self.vertices: List[Vertex] = []
+        self.indices: List[int] = []
+        self.triangle_count = 0
+
+    def get_aabb(self):
+        positions = np.array([v.position for v in self.vertices])
+        return positions.min(axis=0), positions.max(axis=0)
+
+class MeshImporter:
+    @staticmethod
+    def import_obj(filepath: str) -> MeshData:
+        scene = pywavefront.Wavefront(filepath, collect_faces=True)
+
+        mesh = MeshData()
+        vertex_map = {}
+
+        for name, material in scene.materials.items():
+            for face in material.vertices:
+                # face is [x, y, z, nx, ny, nz, u, v, ...]
+                for i in range(0, len(face), 8):
+                    pos = (face[i], face[i+1], face[i+2])
+                    normal = (face[i+3], face[i+4], face[i+5])
+                    uv = (face[i+6], face[i+7])
+
+                    vertex = Vertex(pos, normal, uv)
+                    vertex_key = (pos, normal, uv)
+
+                    if vertex_key not in vertex_map:
+                        vertex_map[vertex_key] = len(mesh.vertices)
+                        mesh.vertices.append(vertex)
+
+                    mesh.indices.append(vertex_map[vertex_key])
+
+        mesh.triangle_count = len(mesh.indices) // 3
+        return mesh
+
+    @staticmethod
+    def generate_lod(mesh: MeshData, target_reduction: float) -> MeshData:
+        """
+        Simple LOD generation via vertex decimation
+        For production: use proper edge collapse algorithm
+        """
+        target_tris = int(mesh.triangle_count * target_reduction)
+
+        # Simplified: just skip triangles (bad quality)
+        # TODO: Implement proper mesh simplification
+        step = max(1, mesh.triangle_count // target_tris)
+
+        lod = MeshData()
+        lod.vertices = mesh.vertices.copy()
+
+        for i in range(0, len(mesh.indices), step * 3):
+            if i + 2 < len(mesh.indices):
+                lod.indices.extend(mesh.indices[i:i+3])
+
+        lod.triangle_count = len(lod.indices) // 3
+        return lod
+```
+
+**Deliverable**: OBJ importer with basic LOD generation
+
+---
+
+### Task 2.5: Texture Converter & Palette Quantization
+
+**Files**:
+```python
+# editor/src/editor/tools/texture_converter.py
+from PIL import Image
+import numpy as np
+from typing import List, Tuple
+
+class PaletteQuantizer:
+    def __init__(self, max_colors=512):
+        self.max_colors = max_colors
+        self.palette: List[Tuple[int, int, int]] = []
+
+    def quantize_image(self, image: Image.Image) -> Tuple[Image.Image, List[Tuple[int, int, int]]]:
+        """
+        Quantize image to indexed color with specified palette size
+        """
+        # Resize if needed
+        if image.width > 256 or image.height > 256:
+            image = image.resize((256, 256), Image.Resampling.LANCZOS)
+
+        # Convert to RGB
+        image = image.convert('RGB')
+
+        # Quantize using median cut
+        quantized = image.quantize(colors=self.max_colors, method=Image.Quantize.MEDIANCUT)
+
+        # Extract palette
+        palette_data = quantized.getpalette()
+        self.palette = [
+            (palette_data[i], palette_data[i+1], palette_data[i+2])
+            for i in range(0, self.max_colors * 3, 3)
+        ]
+
+        return quantized, self.palette
+
+    def save_indexed(self, image: Image.Image, filepath: str):
+        """Save as indexed PNG"""
+        image.save(filepath, 'PNG')
+
+class TextureAtlasPacker:
+    def __init__(self, max_size=2048):
+        self.max_size = max_size
+        self.textures: List[Tuple[str, Image.Image]] = []
+
+    def add_texture(self, name: str, image: Image.Image):
+        self.textures.append((name, image))
+
+    def pack(self) -> Tuple[Image.Image, dict]:
+        """
+        Simple bin packing algorithm
+        Returns: (atlas_image, uv_rects)
+        """
+        # Sort by height (descending)
+        self.textures.sort(key=lambda x: x[1].height, reverse=True)
+
+        # Simple shelf packing
+        atlas = Image.new('RGB', (self.max_size, self.max_size), (0, 0, 0))
+        uv_rects = {}
+
+        current_x = 0
+        current_y = 0
+        row_height = 0
+
+        for name, tex in self.textures:
+            if current_x + tex.width > self.max_size:
+                # New row
+                current_x = 0
+                current_y += row_height
+                row_height = 0
+
+            if current_y + tex.height > self.max_size:
+                print(f"Warning: Texture {name} doesn't fit in atlas")
+                continue
+
+            # Paste texture
+            atlas.paste(tex, (current_x, current_y))
+
+            # Store UV rect (normalized 0-1)
+            uv_rects[name] = {
+                'x': current_x / self.max_size,
+                'y': current_y / self.max_size,
+                'w': tex.width / self.max_size,
+                'h': tex.height / self.max_size
+            }
+
+            current_x += tex.width
+            row_height = max(row_height, tex.height)
+
+        return atlas, uv_rects
+```
+
+**Deliverable**: Palette quantization and texture atlas packing
+
+---
+
+## Phase 2C: Scene Compiler (Week 19-20)
+
+### Task 2.6: Binary Scene Compiler
+
+**Files**:
+```python
+# editor/src/editor/compiler/scene_compiler.py
+import struct
+import json
+from typing import List, Dict
+from editor.tools.mesh_importer import MeshData, Vertex
+
+class SceneCompiler:
+    def __init__(self):
+        self.palette: List[tuple] = []
+        self.textures: List[bytes] = []
+        self.meshes: List[MeshData] = []
+        self.entities: List[dict] = []
+
+    def load_from_json(self, filepath: str):
+        """Load .fca (human-readable scene)"""
+        with open(filepath, 'r') as f:
+            data = json.load(f)
+
+        # TODO: Parse JSON scene format
+        pass
+
+    def compile_to_binary(self, output_path: str):
+        """Write .fcs (binary scene)"""
+        with open(output_path, 'wb') as f:
+            # Header
+            self._write_header(f)
+
+            # Palette
+            palette_offset = f.tell()
+            self._write_palette(f)
+
+            # Textures
+            texture_offset = f.tell()
+            self._write_textures(f)
+
+            # Meshes
+            mesh_offset = f.tell()
+            self._write_meshes(f)
+
+            # Scene
+            scene_offset = f.tell()
+            self._write_scene(f)
+
+            # Update header with offsets
+            f.seek(4)  # Skip magic
+            f.write(struct.pack('I', 1))  # Version
+            f.write(struct.pack('Q', palette_offset))
+            f.write(struct.pack('Q', texture_offset))
+            f.write(struct.pack('Q', mesh_offset))
+            f.write(struct.pack('Q', scene_offset))
+
+    def _write_header(self, f):
+        f.write(b'FCS\0')
+        f.write(struct.pack('I', 1))  # Version
+        f.write(struct.pack('Q', 0))  # Palette offset (placeholder)
+        f.write(struct.pack('Q', 0))  # Texture offset
+        f.write(struct.pack('Q', 0))  # Mesh offset
+        f.write(struct.pack('Q', 0))  # Scene offset
+        f.write(b'\0' * 36)  # Reserved
+
+    def _write_palette(self, f):
+        f.write(struct.pack('I', len(self.palette)))
+        for r, g, b in self.palette:
+            f.write(struct.pack('BBB', r, g, b))
+
+    def _write_textures(self, f):
+        f.write(struct.pack('I', len(self.textures)))
+        for tex_data in self.textures:
+            # TODO: Write texture data
+            pass
+
+    def _write_meshes(self, f):
+        f.write(struct.pack('I', len(self.meshes)))
+        for mesh in self.meshes:
+            # Vertex count
+            f.write(struct.pack('I', len(mesh.vertices)))
+            # Index count
+            f.write(struct.pack('I', len(mesh.indices)))
+
+            # Vertices
+            for v in mesh.vertices:
+                f.write(struct.pack('fff', *v.position))
+                f.write(struct.pack('fff', *v.normal))
+                f.write(struct.pack('ff', *v.texcoord))
+
+            # Indices
+            for idx in mesh.indices:
+                f.write(struct.pack('I', idx))
+
+            # AABB
+            aabb_min, aabb_max = mesh.get_aabb()
+            f.write(struct.pack('fff', *aabb_min))
+            f.write(struct.pack('fff', *aabb_max))
+
+    def _write_scene(self, f):
+        f.write(struct.pack('I', len(self.entities)))
+        for entity in self.entities:
+            # TODO: Write entity data
+            pass
+```
+
+**Deliverable**: Can compile JSON scene to binary .fcs format
+
+---
+
+## Phase 2D: Integration & Polish (Week 21-22)
+
+### Task 2.7: One-Click Build Pipeline
+
+**Files**:
+```python
+# editor/src/editor/tools/build_pipeline.py
+import subprocess
+import shutil
+import os
+from pathlib import Path
+
+class BuildPipeline:
+    def __init__(self, project_path: str):
+        self.project_path = Path(project_path)
+        self.runtime_path = Path(__file__).parent.parent.parent.parent / 'runtime'
+
+    def build_runtime(self, target='pi'):
+        """Cross-compile runtime for Pi Zero 2 W"""
+        build_dir = self.runtime_path / 'build-arm'
+        build_dir.mkdir(exist_ok=True)
+
+        # CMake configure
+        subprocess.run([
+            'cmake',
+            '-B', str(build_dir),
+            '-S', str(self.runtime_path),
+            '-DCMAKE_TOOLCHAIN_FILE=cmake/arm-toolchain.cmake',
+            '-DRASPBERRY_PI=ON'
+        ], check=True)
+
+        # Build
+        subprocess.run([
+            'cmake',
+            '--build', str(build_dir),
+            '-j4'
+        ], check=True)
+
+        return build_dir / 'fantasy_console'
+
+    def create_sd_image(self, output_path: str):
+        """Create bootable SD card image"""
+        # Create directory structure
+        img_dir = Path(output_path)
+        img_dir.mkdir(exist_ok=True)
+
+        # Copy runtime
+        runtime_binary = self.build_runtime()
+        shutil.copy(runtime_binary, img_dir / 'fantasy_console')
+
+        # Copy compiled scene
+        scene_file = self.project_path / 'scene.fcs'
+        shutil.copy(scene_file, img_dir / 'scene.fcs')
+
+        # Create boot script
+        with open(img_dir / 'start.sh', 'w') as f:
+            f.write('#!/bin/bash\n')
+            f.write('cd /home/pi/fantasy_console\n')
+            f.write('./fantasy_console scene.fcs\n')
+
+        print(f"SD card image created at {output_path}")
+        print("Copy to SD card and boot Pi Zero 2 W")
+```
+
+**Deliverable**: Build script that cross-compiles and packages for Pi
+
+---
+
+## Phase 2E: Documentation & Examples (Week 23-24)
+
+### Task 2.8: Example Projects
+
+**Create three example projects**:
+
+1. **hello_cube/**
+   - Single rotating textured cube
+   - Demonstrates basic rendering
+
+2. **physics_demo/**
+   - Stack of boxes with gravity
+   - Demonstrates physics system
+
+3. **mini_game/**
+   - Simple collect-the-coins game
+   - Player controller
+   - Multiple levels
+   - Demonstrates full pipeline
+
+### Task 2.9: Documentation
+
+**Files to create**:
+- `docs/getting-started.md` - Installation and first scene
+- `docs/artist-guide.md` - Asset creation workflow
+- `docs/developer-guide.md` - C API reference
+- `specs/CONSOLE_SPEC.md` - Hardware specification
+- `specs/FCS_FORMAT.md` - File format documentation
+- `specs/API_REFERENCE.md` - Runtime API
+
+---
+
+## Testing Strategy
+
+### Runtime Tests (C)
+```c
+// runtime/tests/test_runner.c
+void run_all_tests() {
+    test_memory();
+    test_math();
+    test_collision();
+    test_physics();
+    test_scene_loader();
+}
+```
+
+### Editor Tests (Python)
+```python
+# editor/tests/test_compiler.py
+import unittest
+from editor.compiler.scene_compiler import SceneCompiler
+
+class TestSceneCompiler(unittest.TestCase):
+    def test_binary_roundtrip(self):
+        compiler = SceneCompiler()
+        # Create test scene
+        # Compile to binary
+        # Load back
+        # Verify integrity
+        pass
+```
+
+---
+
+## Development Milestones
+
+**Month 1-2**: Runtime core functional
+- ✅ Render 50k triangles at 25fps on Pi Zero 2 W
+- ✅ Physics with 25 objects
+- ✅ LOD system working
+
+**Month 3**: Editor functional
+- ✅ Import OBJ files
+- ✅ 3D viewport with manipulation
+- ✅ Scene serialization
+
+**Month 4**: Integration
+- ✅ Compile .fca → .fcs
+- ✅ One-click deploy to Pi
+- ✅ Example project works end-to-end
+
+**Month 5-6**: Polish & docs
+- ✅ Performance profiling
+- ✅ Bug fixes
+- ✅ Complete documentation
+- ✅ Public release
+
+---
+
+## Final Deliverable Checklist
+
+- [ ] Runtime boots on Pi Zero 2 W from SD card
+- [ ] Editor runs on desktop Linux
+- [ ] Can import FBX/OBJ meshes
+- [ ] Can import textures with palette quantization
+- [ ] LOD system reduces poly count correctly
+- [ ] Physics simulation stable at 60hz
+- [ ] Audio playback works
+- [ ] Scene compiler produces valid .fcs files
+- [ ] One-click build pipeline works
+- [ ] Three example projects included
+- [ ] Complete documentation
+- [ ] Unit tests pass
+- [ ] Performance meets spec (25fps, 50k tris)
+
+---
+
+This plan gives Claude Code everything needed to develop both systems from scratch. Each task has clear deliverables and can be implemented incrementally. Want me to start with any specific phase?

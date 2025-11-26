@@ -1,0 +1,46 @@
+# Build directories
+build/
+build-*/
+bin/
+lib/
+
+# CMake files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!cmake/
+
+# Object files
+*.o
+*.obj
+*.so
+*.a
+*.dll
+*.dylib
+
+# Executable
+fantasy_console
+fantasy_console.exe
+
+# IDE files
+.vscode/
+.vs/
+*.vcxproj*
+*.sln
+*.user
+
+# Debug files
+*.pdb
+*.ilk
+
+# Generated files
+*.d
+*.dep
+
+# Temporary files
+*~
+*.swp
+*.tmp
+.DS_Store
